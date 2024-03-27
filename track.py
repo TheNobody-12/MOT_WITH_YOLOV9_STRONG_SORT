@@ -114,10 +114,7 @@ def run(
 
     # Load model
     device = select_device(device)
-    if yolo_weights.is_file(): # is file 
-        model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=data, fp16=half)
-    else:
-        model = attempt_load(Path(yolo_weights), map_location=device)  # load FP32 model
+    model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=data, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 

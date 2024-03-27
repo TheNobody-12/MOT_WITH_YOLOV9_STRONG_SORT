@@ -38,8 +38,7 @@ $ python track.py --source 0  # webcam
 ### Yolov9
 
 There is a clear trade-off between model inference speed and accuracy. In order to make it possible to fulfill your inference speed/accuracy needs
-you can select a Yolov 9family model for automatic download
-
+ You can download the Yolov9 weights from the [official Yolov9 repository](https://github.com/WongKinYiu/yolov9/releases/tag/v0.1)
 ```bash
 
 
