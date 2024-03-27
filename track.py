@@ -27,7 +27,7 @@ if str(ROOT / 'yolov9') not in sys.path:
 if str(ROOT / 'strong_sort') not in sys.path:
     sys.path.append(str(ROOT / 'strong_sort'))  # add strong_sort ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
-
+from yolov9.models.experimental import attempt_load
 from yolov9.models.common import DetectMultiBackend
 from yolov9.utils.dataloaders import LoadImages, LoadStreams, LoadScreenshots
 from yolov9.utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
@@ -114,7 +114,10 @@ def run(
 
     # Load model
     device = select_device(device)
-    model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=data, fp16=half)
+    if yolo_weights.is_file(): # is file 
+        model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=data, fp16=half)
+    else:
+        model = attempt_load(Path(yolo_weights), map_location=device)  # load FP32 model
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
