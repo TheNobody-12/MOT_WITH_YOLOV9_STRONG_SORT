@@ -106,6 +106,35 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=3):
         cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
+def track_and_refine_classes(outputs, threshold):
+    refined_labels = {}
+    # output is a list of detection tuples, where each tuple contains the following elements:
+    # (x_min, y_min, x_max, y_max, track_id, class_label,confidence)
+
+    # ouputs contain the detections for all the objects in the frame
+    if len(outputs) > 0:
+        class_counts = {}
+        total_detections = len(outputs)
+        for detection in outputs:
+            # print(detection)
+            class_label = detection[5]
+            if class_label not in class_counts:
+                class_counts[class_label] = 1
+            else:
+                class_counts[class_label] += 1
+
+
+        # Determine the majority class and refine labels if necessary
+        if class_counts:
+            majority_class = max(class_counts, key=class_counts.get)
+            majority_frequency = class_counts[majority_class] / total_detections
+            if majority_frequency >= threshold:
+                for detection in outputs:
+                    track_id = detection[4]
+                    refined_labels[track_id] = majority_class
+        
+    return refined_labels
+
 
 @torch.no_grad()
 def run(
@@ -138,6 +167,8 @@ def run(
         hide_class=False,  # hide IDs
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        refinement_enabled=True,  # flag to enable or disable refinement
+        refinement_threshold=0.5,  # threshold for refining class labels
 ):
 
     source = str(source)
@@ -283,10 +314,10 @@ def run(
                 strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
+                # # Rescale boxes from img_size to im0 size
                 # det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results
+                # # Print results
                 # for c in det[:, -1].unique():
                 #     n = (det[:, -1] == c).sum()  # detections per class
                 #     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
@@ -301,6 +332,11 @@ def run(
                 t5 = time_sync()
                 dt[3] += t5 - t4
 
+                if refinement_enabled:
+                    refined_labels = track_and_refine_classes( outputs[i], refinement_threshold)
+     
+                        
+
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
@@ -308,41 +344,19 @@ def run(
                         bboxes = output[0:4]
                         id = output[4]
                         cls = output[5]
+                        # update class label if refinement is enabled
+                        if refinement_enabled:
+                            cls = refined_labels[id]
 
-                        # if save_txt:
-                        #     bbox_left = output[0]
-                        #     bbox_top = output[1]
-                        #     bbox_w = output[2] - output[0]
-                        #     bbox_h = output[3] - output[1]
-                        #     # Append index to differentiate text files for multiple videos
-                        #     txt_path = str(save_dir / 'tracks' / (txt_file_name + f'_{frame_idx}.txt'))
-                        #     with open(txt_path, 'a') as file:
-                        #         file.write(f'{p.stem} {frame_idx} {id} {bbox_left} {bbox_top} {bbox_w} {bbox_h} {conf:.2f} {cls}\n')
-
-
-                        # # Save results (image with detections)
-                        # if save_vid:
-                        #     if vid_path[i] != save_path:  # new video
-                        #         vid_path[i] = save_path
-                        #         if isinstance(vid_writer[i], cv2.VideoWriter):
-                        #             vid_writer[i].release()  # release previous video writer
-                        #         if vid_cap:  # video
-                        #             fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        #             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        #             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        #         else:  # stream
-                        #             fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        #         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                        #         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                        #     vid_writer[i].write(im0)
-
+                        
                         if save_txt:
                             # Append index to differentiate text files for multiple videos
                             bbox_left = output[0]
                             bbox_top = output[1]
                             bbox_w = output[2] - output[0]
                             bbox_h = output[3] - output[1]
-                            # restart the frame index at 0 for each video
+
+
                             txt_path = str(save_dir / 'tracks' / (txt_file_name + f'_{i}.txt'))
                             with open(txt_path, 'a') as file:
                                 file.write(f'{p.stem} {frame_idx} {id} {bbox_left} {bbox_top} {bbox_w} {bbox_h} {conf:.2f} {cls}\n')
@@ -381,20 +395,23 @@ def run(
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
-            if save_vid:
-                if vid_path[i] != save_path:  # new video
-                    vid_path[i] = save_path
-                    if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                vid_writer[i].write(im0)
+            if save_img:
+                if dataset.mode == 'image':
+                    cv2.imwrite(save_path, im0)
+                else:  # 'video' or 'stream'
+                    if vid_path[i] != save_path:  # new video
+                        vid_path[i] = save_path
+                        if isinstance(vid_writer[i], cv2.VideoWriter):
+                            vid_writer[i].release()  # release previous video writer
+                        if vid_cap:  # video
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        else:  # stream
+                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer[i].write(im0)
 
             prev_frames[i] = curr_frames[i]
 

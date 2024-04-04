@@ -27,12 +27,11 @@ import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
 from time import time
-from ultralytics import YOLO
 
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # yolov5 strongsort root directory
-WEIGHTS = ROOT / 'weights'
+WEIGHTS = ROOT / 'weights'  # default model.pt path
 
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
@@ -44,6 +43,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from ultralytics.utils.torch_utils import select_device, time_sync
 from datasets import LoadImages, LoadStreams
+from ultralytics.data.loaders import LoadImagesAndVideos, LoadStreams
 from ultralytics.utils import colorstr
 from ultralytics.utils.checks import check_file, check_requirements, check_imshow
 from ultralytics.utils.ops import non_max_suppression, scale_coords
@@ -106,11 +106,40 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=3):
         cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
+def track_and_refine_classes(outputs, threshold):
+    refined_labels = {}
+    # output is a list of detection tuples, where each tuple contains the following elements:
+    # (x_min, y_min, x_max, y_max, track_id, class_label,confidence)
+
+    # ouputs contain the detections for all the objects in the frame
+    if len(outputs) > 0:
+        class_counts = {}
+        total_detections = len(outputs)
+        for detection in outputs:
+            # print(detection)
+            class_label = detection[5]
+            if class_label not in class_counts:
+                class_counts[class_label] = 1
+            else:
+                class_counts[class_label] += 1
+
+
+        # Determine the majority class and refine labels if necessary
+        if class_counts:
+            majority_class = max(class_counts, key=class_counts.get)
+            majority_frequency = class_counts[majority_class] / total_detections
+            if majority_frequency >= threshold:
+                for detection in outputs:
+                    track_id = detection[4]
+                    refined_labels[track_id] = majority_class
+        
+    return refined_labels
+
 
 @torch.no_grad()
 def run(
         source= '0',
-        yolo_weights=WEIGHTS / 'yolov8.pt',  # model.pt path(s),
+        # yolo_weights=WEIGHTS / 'yolov8.pt',  # model.pt path(s),
         strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
         config_strongsort=ROOT / 'strong_sort/configs/strong_sort.yaml',
         imgsz=(640, 640),  # inference size (height, width)
@@ -138,6 +167,8 @@ def run(
         hide_class=False,  # hide IDs
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        refinement_enabled=True,  # flag to enable or disable refinement
+        refinement_threshold=0.5,  # threshold for refining class labels
 ):
 
     source = str(source)
@@ -163,10 +194,15 @@ def run(
 
     # # Load model
     device = select_device(device)
+
+    detection_df = pd.read_csv('detection_results.csv') # load detection results from csv file in format (video_id,frame_id,x_min, y_min, x_max, y_max, class_label,confidence)
+    detection_df = detection_df.sort_values(by=['video_id', 'frame_id'])
+    detection_df = detection_df.reset_index(drop=True)
+    detection_df['track_id'] = -1
+
+    names = detection_df['class_label'].unique() # class names
     
     # WEIGHTS.mkdir(parents=True, exist_ok=True)
-    model = YOLO(yolo_weights).to(device)  # load yolo
-    names, = model.names,
     # stride = model.stride.max().cpu().numpy()  # model stride
     # imgsz = check_img_size(imgsz[0], s=stride)  # check image size
 
@@ -177,7 +213,7 @@ def run(
         dataset = LoadStreams(source, img_size=imgsz)
         nr_sources = len(dataset.sources)
     else:
-        dataset = LoadImages(source)
+        dataset = LoadImagesAndVideos(source)
         nr_sources = 1
     vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
 
@@ -200,13 +236,12 @@ def run(
                 nn_budget=cfg.STRONGSORT.NN_BUDGET,
                 mc_lambda=cfg.STRONGSORT.MC_LAMBDA,
                 ema_alpha=cfg.STRONGSORT.EMA_ALPHA,
-
             )
         )
         strongsort_list[i].model.warmup()
     outputs = [None] * nr_sources
     
-    colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in names] # track colors for each class label
 
     # Run tracking
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
@@ -215,39 +250,37 @@ def run(
     # Initialize variables for FPS calculation
     start_time = time()
     frames_processed = 0
-    for frame_idx, (path, im, im0s, vid_cap) in enumerate(dataset):
 
-        if time() - start_time >= 1:
+    # for frame_idx, (path, im, im0, vid_cap) in enumerate(dataset):
+    for path, im0s, infos in enumerate(dataset):
+
+        if time() - start_time >= 1:  # every second
+            # Calculate FPS
             fps = frames_processed / (time() - start_time)
             print(f'FPS: {fps:.2f}')
-
-            # Draw FPS on the frame
-            cv2.putText(im0, f'FPS: {fps:.2f}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # Reset variables for the next FPS calculation interval
             start_time = time()
-            frames_processed = 0
+            frames_processed = 0   #      
         # Increment the number of frames processed
         frames_processed += 1
+
         s = ''
         t1 = time_sync()
-        im = torch.from_numpy(im).to(device)
-        im = im.half() if half else im.float()  # uint8 to fp16/32
-        im /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
+        #  infos has string in format (f"video {self.count + 1}/{self.nf} (frame {self.frame}/{self.frames}) {path}: ")
+        # get video id and frame id from infos usign regex
+        video_id = int(re.search(r'video (\d+)', infos).group(1))
+        frame_id = int(re.search(r'frame (\d+)', infos).group(1))
+        print(f'Processing video {video_id} frame {frame_id}')
+        # get detections for the current frame for the current video
+        pred = detection_df[detection_df['frame_id'] == frame_id & detection_df['video_id'] == video_id]
         t2 = time_sync()
         dt[0] += t2 - t1
 
-        # Inference
-        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if visualize else False
-        pred = model.predict(im, augment=augment, conf=conf_thres, iou=iou_thres,save_crop=save_crop,name=name, project=project,exist_ok=True)
-        t3 = time_sync()
-        dt[1] += t3 - t2
-
         # Apply NMS
-        # pred = non_max_suppression(pred[0], conf_thres, iou_thres, classes, agnostic_nms)
-        dt[2] += time_sync() - t3
+        t3 = time_sync()
+        if pred is not None and len(pred):
+            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        t4 = time_sync()
+        dt[1] += t4 - t3
         
         # Process detections
         for i, det in enumerate(pred):  # detections per image
@@ -283,10 +316,10 @@ def run(
                 strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
+                # # Rescale boxes from img_size to im0 size
                 # det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results
+                # # Print results
                 # for c in det[:, -1].unique():
                 #     n = (det[:, -1] == c).sum()  # detections per class
                 #     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
@@ -301,6 +334,11 @@ def run(
                 t5 = time_sync()
                 dt[3] += t5 - t4
 
+                if refinement_enabled:
+                    refined_labels = track_and_refine_classes( outputs[i], refinement_threshold)
+     
+                        
+
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
@@ -308,41 +346,19 @@ def run(
                         bboxes = output[0:4]
                         id = output[4]
                         cls = output[5]
+                        # update class label if refinement is enabled
+                        if refinement_enabled:
+                            cls = refined_labels[id]
 
-                        # if save_txt:
-                        #     bbox_left = output[0]
-                        #     bbox_top = output[1]
-                        #     bbox_w = output[2] - output[0]
-                        #     bbox_h = output[3] - output[1]
-                        #     # Append index to differentiate text files for multiple videos
-                        #     txt_path = str(save_dir / 'tracks' / (txt_file_name + f'_{frame_idx}.txt'))
-                        #     with open(txt_path, 'a') as file:
-                        #         file.write(f'{p.stem} {frame_idx} {id} {bbox_left} {bbox_top} {bbox_w} {bbox_h} {conf:.2f} {cls}\n')
-
-
-                        # # Save results (image with detections)
-                        # if save_vid:
-                        #     if vid_path[i] != save_path:  # new video
-                        #         vid_path[i] = save_path
-                        #         if isinstance(vid_writer[i], cv2.VideoWriter):
-                        #             vid_writer[i].release()  # release previous video writer
-                        #         if vid_cap:  # video
-                        #             fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        #             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        #             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        #         else:  # stream
-                        #             fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        #         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                        #         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                        #     vid_writer[i].write(im0)
-
+                        
                         if save_txt:
                             # Append index to differentiate text files for multiple videos
                             bbox_left = output[0]
                             bbox_top = output[1]
                             bbox_w = output[2] - output[0]
                             bbox_h = output[3] - output[1]
-                            # restart the frame index at 0 for each video
+
+
                             txt_path = str(save_dir / 'tracks' / (txt_file_name + f'_{i}.txt'))
                             with open(txt_path, 'a') as file:
                                 file.write(f'{p.stem} {frame_idx} {id} {bbox_left} {bbox_top} {bbox_w} {bbox_h} {conf:.2f} {cls}\n')
@@ -381,20 +397,23 @@ def run(
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
-            if save_vid:
-                if vid_path[i] != save_path:  # new video
-                    vid_path[i] = save_path
-                    if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                vid_writer[i].write(im0)
+            if save_img:
+                if dataset.mode == 'image':
+                    cv2.imwrite(save_path, im0)
+                else:  # 'video' or 'stream'
+                    if vid_path[i] != save_path:  # new video
+                        vid_path[i] = save_path
+                        if isinstance(vid_writer[i], cv2.VideoWriter):
+                            vid_writer[i].release()  # release previous video writer
+                        if vid_cap:  # video
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        else:  # stream
+                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer[i].write(im0)
 
             prev_frames[i] = curr_frames[i]
 

@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 from .sort.nn_matching import NearestNeighborDistanceMetric
 from .sort.detection import Detection
 from .sort.tracker import Tracker
-from .deep.reid_model_factory import show_downloadeable_models, get_model_url, get_model_name
+# from .deep.reid_model_factory import show_downloadeable_models, get_model_url, get_model_name
 
 from torchreid.reid.utils import FeatureExtractor
 from torchreid.reid.utils.tools import download_url
@@ -50,6 +50,7 @@ class StrongSORT(object):
         # run on non-maximum supression
         boxes = np.array([d.tlwh for d in detections])
         scores = np.array([d.confidence for d in detections])
+      
 
         # update tracker
         self.tracker.predict()
